@@ -30,16 +30,7 @@ rl.question('Please enter the topic name to crawl: ', async (topicName) => {
       
       const children = response.interfaceLanguages.swift[0].children;
       
-      children.forEach((item, index) => {
-        if (item.path) {
-          const fullUrl = `https://developer.apple.com${item.path}`;
-          console.log(`[${index}] ${item.title || 'untitled'}`);
-        } else {
-          console.log(`[${index}] No path property - ${item.title || 'N/A'}`);
-        }
-      });
-      
-      console.log(`Found ${children.length} items (${children.filter(item => item.path).length} with paths)`);
+      console.log(`Found ${children.length} items (${children.filter(item => item.path).length} with valid paths)`);
       
       // Collect all valid URLs
       const validUrls = [];
@@ -60,8 +51,8 @@ rl.question('Please enter the topic name to crawl: ', async (topicName) => {
       await crawlPages(validUrls, topicName);
       
     } else {
-      console.log('Cannot find specified path: interfaceLanguages.swift[0].children');
-      console.log('Available top-level properties:', Object.keys(response));
+      console.error('Cannot find specified path: interfaceLanguages.swift[0].children');
+      console.error('Available top-level properties:', Object.keys(response));
     }
     
   } catch (error) {
@@ -106,8 +97,39 @@ function sanitizeFilename(filename) {
     .substring(0, 100); // Limit filename length
 }
 
+// Find related links from the same framework in a page
+function findRelatedLinks(dom, currentFramework) {
+  const links = [];
+  const linkElements = dom.window.document.querySelectorAll('a[href]');
+  
+  linkElements.forEach(link => {
+    const href = link.getAttribute('href');
+    const text = link.textContent.trim();
+    
+    // Check if it's an Apple Developer documentation link
+    if (href && href.includes('/documentation/')) {
+      let fullUrl = href;
+      if (href.startsWith('/')) {
+        fullUrl = `https://developer.apple.com${href}`;
+      }
+      
+      // Check if it belongs to the same framework
+      if (fullUrl.includes(`/documentation/${currentFramework}/`) || 
+          fullUrl.includes(`/documentation/${currentFramework.toLowerCase()}/`)) {
+        links.push({
+          url: fullUrl,
+          title: text || 'Untitled',
+          type: 'related'
+        });
+      }
+    }
+  });
+  
+  return links;
+}
+
 // Use Puppeteer to crawl single page
-async function crawlSinglePage(browser, pageInfo) {
+async function crawlSinglePage(browser, pageInfo, crawledUrls, pendingUrls, currentFramework) {
   const page = await browser.newPage();
   
   try {
@@ -126,6 +148,26 @@ async function crawlSinglePage(browser, pageInfo) {
     // Get page HTML
     const html = await page.content();
     
+    // Find related links (before content extraction, using full DOM)
+    const fullDom = new JSDOM(html, { url: pageInfo.url });
+    const relatedLinks = findRelatedLinks(fullDom, currentFramework);
+    
+    // Add newly discovered links to pending queue
+    let newLinksCount = 0;
+    relatedLinks.forEach(link => {
+      if (!crawledUrls.has(link.url) && !pendingUrls.has(link.url)) {
+        pendingUrls.set(link.url, {
+          url: link.url,
+          title: link.title,
+          type: link.type,
+          index: crawledUrls.size + pendingUrls.size
+        });
+        newLinksCount++;
+      }
+    });
+    
+
+    
     // Use Readability to extract main content
     const dom = new JSDOM(html, { url: pageInfo.url });
     const reader = new Readability(dom.window.document);
@@ -140,29 +182,35 @@ async function crawlSinglePage(browser, pageInfo) {
       
       const markdown = turndownService.turndown(article.content);
       
-      // Generate filename
-      const filename = `${pageInfo.index.toString().padStart(3, '0')}_${sanitizeFilename(pageInfo.title)}.md`;
+      // Extract page title from <title> tag
+      const titleElement = dom.window.document.querySelector('title');
+      const pageTitle = titleElement ? titleElement.textContent.trim() : (article.title || pageInfo.title);
+      
+      // Generate filename using page title
+      const filename = `${pageInfo.index.toString().padStart(3, '0')}_${sanitizeFilename(pageTitle)}.md`;
       
       return {
         filename: filename,
-        content: `# ${article.title || pageInfo.title}\n\n${markdown}`,
-        success: true
+        content: `# ${pageTitle}\n\n${markdown}`,
+        success: true,
+        newLinksFound: newLinksCount
       };
     } else {
-      console.log(`⚠️  Cannot extract content: ${pageInfo.title}`);
-      return { success: false, error: 'Cannot extract content' };
+      console.warn(`⚠️  Unable to extract content: ${pageInfo.title}`);
+      return { success: false, error: 'Unable to extract content', newLinksFound: newLinksCount };
     }
     
   } catch (error) {
-    console.error(`❌ Failed [${pageInfo.index}]: ${pageInfo.title} - ${error.message}`);
-    return { success: false, error: error.message };
+    console.error(`❌ Crawl failed [${pageInfo.index}]: ${pageInfo.title} - ${error.message}`);
+    return { success: false, error: error.message, newLinksFound: 0 };
   } finally {
     await page.close();
   }
 }
 
-// Crawl all pages
+// Crawl all pages with dynamic discovery
 async function crawlPages(urls, topicName) {
+  console.log('Launching Puppeteer...');
   const browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -174,41 +222,75 @@ async function crawlPages(urls, topicName) {
     await fs.ensureDir(outputDir);
     console.log(`Output directory: ${outputDir}`);
     
+    // Initialize tracking sets
+    const crawledUrls = new Set();  // URLs that have been successfully crawled
+    const pendingUrls = new Map();  // URLs waiting to be crawled
+    
+    // Add initial URLs to pending queue
+    urls.forEach(pageInfo => {
+      pendingUrls.set(pageInfo.url, pageInfo);
+    });
+    
     let successCount = 0;
     let errorCount = 0;
+    let totalNewLinksFound = 0;
+    
+    // Extract framework name from topic for related link detection
+    const currentFramework = topicName.toLowerCase();
     
     // Limit concurrent requests to avoid overload
-    const concurrentLimit = 3;
+    const concurrentLimit = 50;
     
-    for (let i = 0; i < urls.length; i += concurrentLimit) {
-      const batch = urls.slice(i, i + concurrentLimit);
-      const promises = batch.map(pageInfo => crawlSinglePage(browser, pageInfo));
+    console.log(`Starting crawl with ${pendingUrls.size} URLs in queue\n`);
+    
+    while (pendingUrls.size > 0) {
+      // Get next batch of URLs to process
+      const currentBatch = Array.from(pendingUrls.values()).slice(0, concurrentLimit);
+      
+      // Remove these URLs from pending queue
+      currentBatch.forEach(pageInfo => {
+        pendingUrls.delete(pageInfo.url);
+        crawledUrls.add(pageInfo.url);
+      });
+      
+      // Process current batch
+      const promises = currentBatch.map(pageInfo => 
+        crawlSinglePage(browser, pageInfo, crawledUrls, pendingUrls, currentFramework)
+      );
       
       const results = await Promise.all(promises);
       
       for (let j = 0; j < results.length; j++) {
         const result = results[j];
-        const pageInfo = batch[j];
+        const pageInfo = currentBatch[j];
         
         if (result.success) {
           // Write file
           const filePath = path.join(outputDir, result.filename);
-          await fs.writeFile(filePath, result.content, 'utf8');
-          console.log(`✅ ${result.filename}`);
+          fs.writeFile(filePath, result.content, 'utf8');
           successCount++;
+          totalNewLinksFound += result.newLinksFound || 0;
         } else {
-          console.log(`❌ ${pageInfo.title} - ${result.error}`);
+          console.error(`❌ Failed: ${pageInfo.title} - ${result.error}`);
           errorCount++;
+          if (result.newLinksFound) {
+            totalNewLinksFound += result.newLinksFound;
+          }
         }
       }
       
-      // Delay between batches
-      if (i + concurrentLimit < urls.length) {
+      // Show progress and wait between batches
+      if (pendingUrls.size > 0) {
+        console.log(`Progress: ${successCount + errorCount} completed, ${pendingUrls.size} remaining\n`);
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
     
-    console.log(`\nCompleted: ${successCount} success, ${errorCount} failed (${urls.length} total)`);
+    console.log(`\n🎉 Crawl completed!`);
+    console.log(`✅ Success: ${successCount}`);
+    console.log(`❌ Failed: ${errorCount}`);
+    console.log(`🔗 New links discovered: ${totalNewLinksFound}`);
+    console.log(`📄 Total pages processed: ${successCount + errorCount}`);
     
   } finally {
     await browser.close();
